@@ -30,7 +30,7 @@
 
 ```bash
 # 克隆或下载项目
-git clone <your-repo-url>
+git clone https://github.com/6639835/XPlanetoFDPro
 cd XPlanetoFDPro
 
 # 直接运行（无需安装依赖）
