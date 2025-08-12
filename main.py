@@ -29,7 +29,7 @@ XPLANE_DATA_PORT = 49002  # 接收X-Plane Data Output的端口
 FDPRO_PORT = 4000        # FDPRO 默认监听端口
 
 # Traffic Report 配置
-MAX_TRAFFIC_TARGETS = 60    # X-Plane最多支持60个交通目标
+MAX_TRAFFIC_TARGETS = 63    # X-Plane最多支持63个交通目标 (ID: 1-63, 0是自己飞机)
 
 # 广播地址选择 (基于iPad IP地址)：
 BROADCAST_IP = "10.16.25.146"     # iPad的具体IP地址 (直接发送)
@@ -683,23 +683,22 @@ class TrafficTarget:
     
     def update_data(self, xplane_values):
         """从X-Plane数据更新目标信息"""
-        # 数据映射（基于用户提供的datarefs）
-        dataref_mapping = {
+        # 单个飞机的数据映射
+        individual_dataref_mapping = {
             f'sim/cockpit2/tcas/targets/position/double/plane{self.plane_id}_lat': 'lat',
             f'sim/cockpit2/tcas/targets/position/double/plane{self.plane_id}_lon': 'lon', 
-            f'sim/cockpit2/tcas/targets/position/double/plane{self.plane_id}_ele': 'alt',
-            f'sim/cockpit2/tcas/targets/position/plane{self.plane_id}_vertical_speed': 'vs',
-            f'sim/cockpit2/tcas/targets/position/plane{self.plane_id}_psi': 'track'
+            f'sim/cockpit2/tcas/targets/position/double/plane{self.plane_id}_ele': 'alt'
         }
         
         # 添加tailnum字符数组的映射
         for char_idx in range(8):
-            dataref_mapping[f'sim/multiplayer/position/plane{self.plane_id}_tailnum[{char_idx}]'] = f'tailnum_char_{char_idx}'
+            individual_dataref_mapping[f'sim/multiplayer/position/plane{self.plane_id}_tailnum[{char_idx}]'] = f'tailnum_char_{char_idx}'
         
         updated = False
         old_callsign = self.data.get('callsign', f'TRF{self.plane_id:03d}')
         
-        for dataref, key in dataref_mapping.items():
+        # 处理单个飞机的datarefs
+        for dataref, key in individual_dataref_mapping.items():
             if dataref in xplane_values:
                 value = xplane_values[dataref]
                 
@@ -715,6 +714,68 @@ class TrafficTarget:
                     updated = True
                 elif key in ['alt'] and abs(value) > 1.0:  # 高度大于1英尺认为有效
                     updated = True
+        
+        # 处理数组格式的datarefs (垂直速度和航向)
+        # 垂直速度数组 (64个float，索引0是自己飞机，1-63是其他飞机)
+        vs_dataref = 'sim/cockpit2/tcas/targets/position/vertical_speed'
+        if vs_dataref in xplane_values:
+            vs_data = xplane_values[vs_dataref]
+            
+            # 处理不同的数据格式 - 可能是单个值、数组或字符串
+            if isinstance(vs_data, (list, tuple)) and len(vs_data) > self.plane_id:
+                # 直接数组格式
+                vs_value = vs_data[self.plane_id]
+                if isinstance(vs_value, (int, float)) and abs(vs_value) > 0.001:
+                    self.data['vs'] = vs_value
+                    updated = True
+            elif isinstance(vs_data, str):
+                # 字符串格式，需要解析（如逗号分隔的值）
+                try:
+                    vs_values = [float(x.strip()) for x in vs_data.split(',')]
+                    if len(vs_values) > self.plane_id:
+                        vs_value = vs_values[self.plane_id]
+                        if abs(vs_value) > 0.001:
+                            self.data['vs'] = vs_value
+                            updated = True
+                except (ValueError, IndexError):
+                    pass  # 解析失败，忽略
+            elif isinstance(vs_data, (int, float)):
+                # 单个值 - 可能是特定飞机的数据
+                if abs(vs_data) > 0.001:
+                    self.data['vs'] = vs_data
+                    updated = True
+        
+        # 航向数组 (64个float，索引0是自己飞机，1-63是其他飞机)  
+        psi_dataref = 'sim/cockpit2/tcas/targets/position/psi'
+        if psi_dataref in xplane_values:
+            psi_data = xplane_values[psi_dataref]
+            
+            # 处理不同的数据格式 - 可能是单个值、数组或字符串
+            if isinstance(psi_data, (list, tuple)) and len(psi_data) > self.plane_id:
+                # 直接数组格式
+                track_value = psi_data[self.plane_id] 
+                if isinstance(track_value, (int, float)) and -360 <= track_value <= 360:
+                    self.data['track'] = track_value
+                    if abs(track_value) > 0.001:  # 非零航向认为是活跃的
+                        updated = True
+            elif isinstance(psi_data, str):
+                # 字符串格式，需要解析（如逗号分隔的值）
+                try:
+                    psi_values = [float(x.strip()) for x in psi_data.split(',')]
+                    if len(psi_values) > self.plane_id:
+                        track_value = psi_values[self.plane_id]
+                        if -360 <= track_value <= 360:
+                            self.data['track'] = track_value
+                            if abs(track_value) > 0.001:
+                                updated = True
+                except (ValueError, IndexError):
+                    pass  # 解析失败，忽略
+            elif isinstance(psi_data, (int, float)):
+                # 单个值 - 可能是特定飞机的数据
+                if -360 <= psi_data <= 360:
+                    self.data['track'] = psi_data
+                    if abs(psi_data) > 0.001:
+                        updated = True
         
         # 重构tailnum字符串
         if updated:
@@ -831,14 +892,27 @@ class CombinedXPlaneReceiver:
                 print("订阅交通数据...")
                 datarefs_subscribed = 0
                 
-                # 订阅更多目标以获取完整的交通情况
-                for plane_id in range(1, min(21, MAX_TRAFFIC_TARGETS + 1)):
+                # 订阅数组格式的datarefs (包含所有64个飞机的数据)
+                array_datarefs = [
+                    'sim/cockpit2/tcas/targets/position/vertical_speed',  # 64个float的垂直速度数组
+                    'sim/cockpit2/tcas/targets/position/psi'              # 64个float的航向数组
+                ]
+                
+                for dataref in array_datarefs:
+                    try:
+                        self.xplane_udp.add_dataref(dataref, freq=10)  # 10Hz更新频率
+                        datarefs_subscribed += 1
+                        print(f"  ✅ 订阅数组dataref: {dataref}")
+                    except Exception as e:
+                        print(f"  ⚠️  无法订阅数组dataref {dataref}: {e}")
+                
+                # 订阅单个飞机的datarefs (位置、高度、tailnum)
+                # 支持更多飞机目标 (1-63)
+                for plane_id in range(1, min(64, MAX_TRAFFIC_TARGETS + 1)):
                     datarefs = [
                         f'sim/cockpit2/tcas/targets/position/double/plane{plane_id}_lat',
                         f'sim/cockpit2/tcas/targets/position/double/plane{plane_id}_lon',
-                        f'sim/cockpit2/tcas/targets/position/double/plane{plane_id}_ele',
-                        f'sim/cockpit2/tcas/targets/position/plane{plane_id}_vertical_speed',
-                        f'sim/cockpit2/tcas/targets/position/plane{plane_id}_psi'
+                        f'sim/cockpit2/tcas/targets/position/double/plane{plane_id}_ele'
                     ]
                     
                     # 为字符串tailnum添加每个字符位置的dataref (最多8个字符)
@@ -854,11 +928,11 @@ class CombinedXPlaneReceiver:
                                 print(f"  警告: 无法订阅 {dataref}: {e}")
                             continue
                     
-                    # 为了避免过载，每3个飞机暂停一下
-                    if plane_id % 3 == 0:
-                        time.sleep(0.3)
+                    # 为了避免过载，每5个飞机暂停一下
+                    if plane_id % 5 == 0:
+                        time.sleep(0.2)
                 
-                print(f"✅ 订阅了 {datarefs_subscribed} 个交通datarefs")
+                print(f"✅ 订阅了 {datarefs_subscribed} 个交通datarefs (包含数组格式)")
             
             self.running = True
             threading.Thread(target=self._receive_loop, daemon=True).start()
