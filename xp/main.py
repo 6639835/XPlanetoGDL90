@@ -16,7 +16,6 @@ import urllib.request
 import json
 import platform
 import datetime
-import argparse
 
 # X-Plane 配置
 XPLANE_IP = "192.168.0.1"  # X-Plane 12 运行在本机
@@ -27,9 +26,6 @@ XPLANE_DATA_PORT = 49002  # 接收X-Plane Data Output的端口
 
 # FDPRO 配置
 FDPRO_PORT = 4000        # FDPRO 默认监听端口
-
-# Traffic Report 配置
-MAX_TRAFFIC_TARGETS = 60    # X-Plane最多支持60个交通目标
 
 # 广播地址选择 (基于iPad IP地址)：
 BROADCAST_IP = "10.16.25.146"     # iPad的具体IP地址 (直接发送)
@@ -225,8 +221,8 @@ class InlineGDL90Encoder:
         msg.append(((altitude & 0x0f) << 4) | (misc & 0xf))
         
         # 导航完整性类别和精度类别
-        nav_integrity_cat = 11    # NIC = 11 (HPL < 7.5m, VPL < 11m)
-        nav_accuracy_cat = 10     # NACp = 10 (HFOM < 10m, VFOM < 15m)
+        nav_integrity_cat = 11
+        nav_accuracy_cat = 11
         msg.append(((nav_integrity_cat & 0xf) << 4) | (nav_accuracy_cat & 0xf))
         
         # 水平速度
@@ -269,138 +265,6 @@ class InlineGDL90Encoder:
         # 代码是高4位，低4位是'备用'
         code = 0
         msg.append((code & 0xf) << 4)
-        
-        return self._prepared_message(msg)
-    
-    def create_traffic_report(self, data):
-        """
-        创建Traffic Report消息 (ID 0x14)
-        
-        data: 包含以下键的字典
-          - lat: 纬度 (度)
-          - lon: 经度 (度)
-          - alt: 高度 (英尺, MSL)
-          - speed: 地速 (节)
-          - track: 航向 (度)
-          - vs: 垂直速度 (英尺/分钟)
-          - callsign: 呼号 (字符串)
-          - icao_address: ICAO地址 (可选，默认生成)
-        """
-        # 获取并验证数据 - 支持字典和TrafficTarget对象两种格式
-        if hasattr(data, 'get'):  # 字典格式
-            lat_deg = data.get('lat', 0.0)
-            lon_deg = data.get('lon', 0.0)
-            alt_ft = data.get('alt', 0.0)
-            speed_kts = data.get('speed', 0.0)
-            track_deg = data.get('track', 0.0)
-            vs_fpm = data.get('vs', 0.0)
-            callsign = data.get('callsign', 'TRAFFIC')[:8].ljust(8)
-            icao_address = data.get('icao_address', 0x123456)  # 默认ICAO地址
-        else:  # TrafficTarget对象格式
-            try:
-                # 尝试访问TrafficTarget的属性
-                target_data = data.data if hasattr(data, 'data') else data
-                lat_deg = target_data.get('lat', 0.0) if hasattr(target_data, 'get') else getattr(target_data, 'lat', 0.0)
-                lon_deg = target_data.get('lon', 0.0) if hasattr(target_data, 'get') else getattr(target_data, 'lon', 0.0)
-                alt_ft = target_data.get('alt', 0.0) if hasattr(target_data, 'get') else getattr(target_data, 'alt', 0.0)
-                speed_kts = target_data.get('speed', 0.0) if hasattr(target_data, 'get') else getattr(target_data, 'speed', 0.0)
-                track_deg = target_data.get('track', 0.0) if hasattr(target_data, 'get') else getattr(target_data, 'track', 0.0)
-                vs_fpm = target_data.get('vs', 0.0) if hasattr(target_data, 'get') else getattr(target_data, 'vs', 0.0)
-                callsign = (target_data.get('callsign', 'TRAFFIC') if hasattr(target_data, 'get') else getattr(target_data, 'callsign', 'TRAFFIC'))[:8].ljust(8)
-                # ICAO地址优先从对象属性获取
-                icao_address = getattr(data, 'icao_address', 0x123456)
-            except AttributeError:
-                # 如果都访问失败，使用默认值
-                lat_deg = lon_deg = alt_ft = speed_kts = track_deg = vs_fpm = 0.0
-                callsign = 'TRAFFIC'.ljust(8)
-                icao_address = 0x123456
-        
-        # 检查数据有效性
-        if not (-90 <= lat_deg <= 90) or not (-180 <= lon_deg <= 180):
-            print(f"警告: Traffic无效的经纬度数据 LAT={lat_deg}, LON={lon_deg}")
-            lat_deg = lon_deg = 0.0
-        
-        # 构建Traffic Report消息(ID 0x14)
-        msg = bytearray([0x14])  # 消息ID
-        
-        # 根据官方规范和example: st aa aa aa
-        # 字节1: s(1位) + t(3位) + 4位填充(0)
-        traffic_alert_status = 0  # 0 = 无交通警报
-        address_type = 0          # 0 = ADS-B with ICAO address
-        padding = 0               # 4位填充为0
-        
-        byte1 = ((traffic_alert_status & 0x1) << 7) | ((address_type & 0x7) << 4) | padding
-        msg.append(byte1)
-        
-        # 字节2-4: 完整的24位ICAO地址(3字节)
-        msg.extend(self._pack24bit(icao_address & 0xFFFFFF))
-        
-        # 纬度(24位)
-        msg.extend(self._pack24bit(self._make_latitude(lat_deg)))
-        
-        # 经度(24位)
-        msg.extend(self._pack24bit(self._make_longitude(lon_deg)))
-        
-        # 高度：25英尺增量，偏移+1000英尺 (12位)
-        altitude = int((alt_ft + 1000) / 25.0)
-        if altitude < 0: altitude = 0
-        if altitude > 0xffe: altitude = 0xffe
-        
-        # 杂项指示器(4位)
-        misc = 9  # 默认杂项值
-        
-        # 高度(12位) + 杂项(4位) = 2字节
-        msg.append((altitude & 0xff0) >> 4)  # 高度的高8位
-        msg.append(((altitude & 0x0f) << 4) | (misc & 0xf))
-        
-        # 导航完整性类别(NIC, 4位) + 导航精度类别(NACp, 4位)
-        # 根据官方example使用更合适的默认值
-        nav_integrity_cat = 11    # NIC = 11 (HPL < 7.5m, VPL < 11m)
-        nav_accuracy_cat = 10     # NACp = 10 (HFOM < 10m, VFOM < 15m)  
-        msg.append(((nav_integrity_cat & 0xf) << 4) | (nav_accuracy_cat & 0xf))
-        
-        # 水平速度 (12位)
-        h_velocity = int(speed_kts) if speed_kts is not None else 0xfff
-        if h_velocity < 0:
-            h_velocity = 0
-        elif h_velocity > 0xffe:
-            h_velocity = 0xffe
-        
-        # 垂直速度 (12位, 64fpm单位)
-        if vs_fpm is None:
-            v_velocity = 0x800  # 无数据标志
-        else:
-            if vs_fpm > 32576:
-                v_velocity = 0x1fe
-            elif vs_fpm < -32576:
-                v_velocity = 0xe02
-            else:
-                v_velocity = int(vs_fpm / 64)  # 转换为64fpm增量
-                if v_velocity < 0:
-                    v_velocity = (0x1000 + v_velocity) & 0xfff  # 12位2的补码
-        
-        # 打包速度：水平速度(12位) + 垂直速度(12位) = 3字节
-        # HHH HVV VVV
-        msg.append((h_velocity & 0xff0) >> 4)  # 水平速度高8位
-        msg.append(((h_velocity & 0xf) << 4) | ((v_velocity & 0xf00) >> 8))  # 水平速度低4位 + 垂直速度高4位
-        msg.append(v_velocity & 0xff)  # 垂直速度低8位
-        
-        # 航向/航道 (8位)
-        track_heading = int(track_deg / (360.0 / 256))  # 转换为1.4度单位
-        msg.append(track_heading & 0xff)
-        
-        # 发射器类别 (8位)
-        emitter_cat = 1  # 轻型飞机
-        msg.append(emitter_cat & 0xff)
-        
-        # 呼号(8字节ASCII)
-        call_sign_bytes = bytearray(callsign.encode('ascii')[:8].ljust(8, b' '))
-        msg.extend(call_sign_bytes)
-        
-        # 应急/优先代码(4位) + 备用(4位)
-        emergency_code = 0  # 无应急
-        spare = 0          # 备用
-        msg.append(((emergency_code & 0xf) << 4) | (spare & 0xf))
         
         return self._prepared_message(msg)
 
@@ -551,12 +415,6 @@ class GDL90Encoder:
     
     def create_position_report(self, data):
         return self.encoder.create_position_report(data)
-    
-    def create_traffic_report(self, target):
-        """为交通目标创建traffic report"""
-        data = target.data.copy()
-        data['icao_address'] = target.icao_address
-        return self.encoder.create_traffic_report(data)
 
 class XPlaneDataReceiverNew:
     """使用内置XPlane-UDP功能的数据接收器"""
@@ -577,7 +435,7 @@ class XPlaneDataReceiverNew:
             print(f"✅ 找到X-Plane: {self.beacon_data}")
             
             # 订阅需要的datarefs
-            print("订阅自机数据...")
+            print("订阅flight数据...")
             datarefs = [
                 ("sim/flightmodel/position/latitude", 'lat'),
                 ("sim/flightmodel/position/longitude", 'lon'),
@@ -591,6 +449,7 @@ class XPlaneDataReceiverNew:
             
             for dataref, key in datarefs:
                 self.xplane_udp.add_dataref(dataref, freq=10)
+                print(f"  订阅: {dataref}")
             
             self.running = True
             threading.Thread(target=self._receive_loop, daemon=True).start()
@@ -659,287 +518,6 @@ class XPlaneDataReceiverNew:
                 if self.running:
                     print(f"接收数据错误: {e}")
                 break
-    
-    def stop(self):
-        """停止接收数据"""
-        print("停止接收数据...")
-        self.running = False
-
-# =============================================================================
-# Traffic Report功能
-# =============================================================================
-
-class TrafficTarget:
-    """表示一个交通目标"""
-    def __init__(self, plane_id):
-        self.plane_id = plane_id
-        self.icao_address = 0x100000 + plane_id  # 生成唯一的ICAO地址
-        self.data = {
-            'lat': 0.0, 'lon': 0.0, 'alt': 0.0, 'speed': 0.0,
-            'track': 0.0, 'vs': 0.0, 'callsign': f'TRF{plane_id:03d}'
-        }
-        self.last_update = 0
-        self.active = False
-    
-    def update_data(self, xplane_values):
-        """从X-Plane数据更新目标信息"""
-        # 数据映射（基于用户提供的datarefs）
-        dataref_mapping = {
-            f'sim/cockpit2/tcas/targets/position/double/plane{self.plane_id}_lat': 'lat',
-            f'sim/cockpit2/tcas/targets/position/double/plane{self.plane_id}_lon': 'lon', 
-            f'sim/cockpit2/tcas/targets/position/double/plane{self.plane_id}_ele': 'alt',
-            f'sim/cockpit2/tcas/targets/position/plane{self.plane_id}_vertical_speed': 'vs',
-            f'sim/cockpit2/tcas/targets/position/plane{self.plane_id}_psi': 'track'
-        }
-        
-        # 添加tailnum字符数组的映射
-        for char_idx in range(8):
-            dataref_mapping[f'sim/multiplayer/position/plane{self.plane_id}_tailnum[{char_idx}]'] = f'tailnum_char_{char_idx}'
-        
-        updated = False
-        old_callsign = self.data.get('callsign', f'TRF{self.plane_id:03d}')
-        
-        for dataref, key in dataref_mapping.items():
-            if dataref in xplane_values:
-                value = xplane_values[dataref]
-                
-                if key == 'alt':
-                    # 高度从米转换为英尺
-                    value = value * 3.28084
-                
-                # 存储所有数据
-                self.data[key] = value
-                
-                # 检查数据是否有效（非零表示活跃）
-                if key in ['lat', 'lon'] and abs(value) > 0.00001:
-                    updated = True
-                elif key in ['alt'] and abs(value) > 1.0:  # 高度大于1英尺认为有效
-                    updated = True
-        
-        # 重构tailnum字符串
-        if updated:
-            tailnum_chars = []
-            for char_idx in range(8):
-                char_key = f'tailnum_char_{char_idx}'
-                if char_key in self.data:
-                    char_code = int(self.data[char_key])
-                    if 32 <= char_code <= 126:  # 可打印ASCII字符
-                        tailnum_chars.append(chr(char_code))
-                    elif char_code == 0:  # 字符串结束
-                        break
-                    else:
-                        tailnum_chars.append('?')  # 非打印字符
-                else:
-                    break
-            
-            # 生成callsign
-            if tailnum_chars:
-                # 使用重构的真实tailnum
-                callsign = ''.join(tailnum_chars).strip()[:8]
-                if callsign:
-                    if callsign != old_callsign:
-                        print(f"✈️  交通目标{self.plane_id}: {callsign}")
-                    self.data['callsign'] = callsign
-                else:
-                    # fallback到生成的callsign
-                    callsign = self._generate_callsign()
-                    self.data['callsign'] = callsign
-            else:
-                # fallback到生成的callsign
-                callsign = self._generate_callsign()
-                self.data['callsign'] = callsign
-        
-
-        
-        if updated:
-            self.last_update = time.time()
-            self.active = True
-        else:
-            # 如果超过30秒没有更新，标记为非活跃
-            if time.time() - self.last_update > 30.0:
-                self.active = False
-        
-        return updated
-    
-    def _generate_callsign(self):
-        """基于可用的ID信息生成callsign"""
-        # 注意：由于X-Plane UDP协议限制，tailnum返回0.0而不是真实字符串
-        # 我们需要用其他方法生成有意义的callsign
-        
-        # 方案1: 基于位置生成相对稳定的唯一标识
-        lat = self.data.get('lat', 0)
-        lon = self.data.get('lon', 0)
-        if lat != 0 or lon != 0:
-            # 使用位置的哈希生成相对稳定的ID
-            pos_hash = abs(hash((round(lat, 4), round(lon, 4)))) % 9999
-            return f"T{pos_hash:04d}"[:8]
-        
-        # 方案2: 使用ICAO地址生成callsign (如果将来能获取到的话)
-        icao_addr = getattr(self, 'icao_address', 0)
-        if icao_addr and icao_addr != 0x100000 + self.plane_id:
-            return f"I{icao_addr & 0xFFFF:04X}"[:8]
-        
-        # 方案3: 默认格式
-        return f'TRF{self.plane_id:03d}'
-
-class CombinedXPlaneReceiver:
-    """整合的X-Plane数据接收器 - 同时处理自己飞机和交通目标"""
-    def __init__(self, enable_traffic=False):
-        self.xplane_udp = XPlaneUdpInline()
-        self.enable_traffic = enable_traffic
-        
-        # 自己飞机数据
-        self.current_data = {
-            'lat': 0.0, 'lon': 0.0, 'alt': 0.0, 'speed': 0.0,
-            'track': 0.0, 'vs': 0.0, 'pitch': 0.0, 'roll': 0.0
-        }
-        
-        # 交通目标数据（仅在启用时使用）
-        self.traffic_targets = {}
-        if enable_traffic:
-            for i in range(1, MAX_TRAFFIC_TARGETS + 1):
-                self.traffic_targets[i] = TrafficTarget(i)
-        
-        self.running = False
-        self.beacon_data = None
-    
-    def start(self):
-        """开始接收X-Plane数据"""
-        try:
-            print("正在寻找X-Plane...")
-            self.beacon_data = self.xplane_udp.find_ip()
-            print(f"✅ 找到X-Plane: {self.beacon_data}")
-            
-            # 订阅自己飞机的datarefs
-            print("订阅自机数据...")
-            own_datarefs = [
-                ("sim/flightmodel/position/latitude", 'lat'),
-                ("sim/flightmodel/position/longitude", 'lon'),
-                ("sim/flightmodel/position/elevation", 'alt'),
-                ("sim/flightmodel/position/groundspeed", 'speed'),
-                ("sim/flightmodel/position/psi", 'track'),
-                ("sim/flightmodel/position/vh_ind_fpm", 'vs'),
-                ("sim/flightmodel/position/theta", 'pitch'),
-                ("sim/flightmodel/position/phi", 'roll')
-            ]
-            
-            for dataref, key in own_datarefs:
-                self.xplane_udp.add_dataref(dataref, freq=10)
-            
-            # 如果启用交通目标，订阅TCAS datarefs
-            if self.enable_traffic:
-                print("订阅交通数据...")
-                datarefs_subscribed = 0
-                
-                # 订阅更多目标以获取完整的交通情况
-                for plane_id in range(1, min(21, MAX_TRAFFIC_TARGETS + 1)):
-                    datarefs = [
-                        f'sim/cockpit2/tcas/targets/position/double/plane{plane_id}_lat',
-                        f'sim/cockpit2/tcas/targets/position/double/plane{plane_id}_lon',
-                        f'sim/cockpit2/tcas/targets/position/double/plane{plane_id}_ele',
-                        f'sim/cockpit2/tcas/targets/position/plane{plane_id}_vertical_speed',
-                        f'sim/cockpit2/tcas/targets/position/plane{plane_id}_psi'
-                    ]
-                    
-                    # 为字符串tailnum添加每个字符位置的dataref (最多8个字符)
-                    for char_idx in range(8):
-                        datarefs.append(f'sim/multiplayer/position/plane{plane_id}_tailnum[{char_idx}]')
-                    
-                    for dataref in datarefs:
-                        try:
-                            self.xplane_udp.add_dataref(dataref, freq=5)  # 5Hz更新频率
-                            datarefs_subscribed += 1
-                        except Exception as e:
-                            if plane_id <= 3:  # 只对前3个飞机打印错误
-                                print(f"  警告: 无法订阅 {dataref}: {e}")
-                            continue
-                    
-                    # 为了避免过载，每3个飞机暂停一下
-                    if plane_id % 3 == 0:
-                        time.sleep(0.3)
-                
-                print(f"✅ 订阅了 {datarefs_subscribed} 个交通datarefs")
-            
-            self.running = True
-            threading.Thread(target=self._receive_loop, daemon=True).start()
-            
-            # 等待数据
-            print("等待5秒钟查看是否收到数据...")
-            time.sleep(5)
-            
-            # 检查是否收到数据
-            values = self.xplane_udp.get_values()
-            if values:
-                print("✅ 成功接收到飞行数据!")
-                self._update_current_data(values)
-                
-                if self.enable_traffic:
-                    active_targets = self.get_active_targets()
-                    if active_targets:
-                        pass  # 交通目标数量在状态中显示
-                    else:
-                        pass  # 无交通目标的提示在状态中显示
-                
-                return True
-            else:
-                print("⚠️  5秒后仍未收到数据")
-                return False
-                
-        except Exception as e:
-            print(f"启动XPlane连接失败: {e}")
-            return False
-    
-    def _update_current_data(self, xplane_values):
-        """更新自己飞机数据"""
-        dataref_mapping = {
-            'sim/flightmodel/position/latitude': 'lat',
-            'sim/flightmodel/position/longitude': 'lon',
-            'sim/flightmodel/position/elevation': 'alt',
-            'sim/flightmodel/position/groundspeed': 'speed',
-            'sim/flightmodel/position/psi': 'track',
-            'sim/flightmodel/position/vh_ind_fpm': 'vs',
-            'sim/flightmodel/position/theta': 'pitch',
-            'sim/flightmodel/position/phi': 'roll'
-        }
-        
-        for dataref, value in xplane_values.items():
-            if dataref in dataref_mapping:
-                key = dataref_mapping[dataref]
-                
-                if key == 'alt':
-                    # 高度从米转换为英尺
-                    self.current_data[key] = value * 3.28084
-                elif key == 'speed':
-                    # 地速从米/秒转换为节
-                    self.current_data[key] = value * 1.94384
-                else:
-                    # 其他数据直接使用
-                    self.current_data[key] = value
-        
-        # 更新交通目标数据
-        if self.enable_traffic:
-            for target in self.traffic_targets.values():
-                target.update_data(xplane_values)
-    
-    def _receive_loop(self):
-        """接收数据循环"""
-        print("开始接收XPlane数据...")
-        while self.running:
-            try:
-                values = self.xplane_udp.get_values()
-                if values:
-                    self._update_current_data(values)
-                time.sleep(0.1)
-            except Exception as e:
-                if self.running:
-                    print(f"接收数据错误: {e}")
-                break
-    
-    def get_active_targets(self):
-        """获取活跃的交通目标列表"""
-        if not self.enable_traffic:
-            return []
-        return [target for target in self.traffic_targets.values() if target.active]
     
     def stop(self):
         """停止接收数据"""
@@ -1035,37 +613,7 @@ def check_xplane_settings():
     print("   - 可以使用自动飞行或手动飞行")
     print("="*50)
 
-def check_traffic_settings():
-    """检查X-Plane交通设置并提供指导"""
-    local_ip = get_local_ip()
-    
-    print("\n" + "="*60)
-    print("🛩️  X-Plane 交通目标设置")  
-    print("="*60)
-    print("为了接收交通目标数据，需要确保:")
-    print()
-    print("1. AI交通设置:")
-    print("   - Aircraft & Situations → AI Aircraft")
-    print("   - 启用 AI aircraft 数量 > 0")
-    print("   - 或者使用多人游戏模式")
-    print()
-    print("2. TCAS设置:")
-    print("   - 确保飞机配备了TCAS系统")
-    print("   - TCAS系统应该处于活跃状态")
-    print()
-    print("3. 网络设置:")
-    print("   - Settings → Network")
-    print("   - 确保 'Accept incoming connections' 已启用")
-    print()
-    print("4. 数据输出:")
-    print("   - 本程序会自动订阅TCAS datarefs")
-    print("   - 不需要手动配置Data Output")
-    print()
-    print("注意: 交通目标数据依赖于X-Plane的AI交通或多人游戏")
-    print("      如果没有其他飞机，将不会有交通数据")
-    print("="*60)
-
-def broadcast_gdl90(enable_traffic=False):
+def broadcast_gdl90():
     """广播GDL-90数据给FDPRO"""
     # 首先检查X-Plane是否运行
     print("🔍 检查X-Plane状态...")
@@ -1081,16 +629,11 @@ def broadcast_gdl90(enable_traffic=False):
     else:
         print(f"✅ 检测到X-Plane运行在: {detected_ip}")
     
-    # 根据模式提供不同的设置指导
-    if enable_traffic:
-        check_traffic_settings()
-    else:
-        check_xplane_settings()
+    # 提供设置指导
+    check_xplane_settings()
     
     # 等待用户确认
-    mode_text = "自己飞机位置 + 交通目标" if enable_traffic else "自己飞机位置"
-    print(f"\n模式: {mode_text}")
-    print("请确认已按照上述指导检查X-Plane设置，然后按 Enter 继续...")
+    print("\n请确认已按照上述指导检查X-Plane设置，然后按 Enter 继续...")
     try:
         input()
     except KeyboardInterrupt:
@@ -1104,9 +647,9 @@ def broadcast_gdl90(enable_traffic=False):
     # 创建GDL-90编码器
     encoder = GDL90Encoder(aircraft_id="PYTHON1")
     
-    # 使用整合的接收器
-    print("\n=== 连接到X-Plane ===")
-    xplane_receiver = CombinedXPlaneReceiver(enable_traffic=enable_traffic)
+    # 使用XPlane-UDP方式
+    print("\n=== 使用XPlane-UDP库自动发现和连接 ===")
+    xplane_receiver = XPlaneDataReceiverNew()
     
     if not xplane_receiver.start():
         print("❌ 无法连接到X-Plane")
@@ -1120,29 +663,21 @@ def broadcast_gdl90(enable_traffic=False):
         print("\n请检查:")
         print("1. X-Plane -> Settings -> Network -> 是否启用了 'Accept incoming connections'")
         print("2. 飞机是否已加载并在飞行中")
-        if enable_traffic:
-            print("3. 是否启用了AI交通或多人游戏")
-        print("4. 防火墙设置是否允许UDP连接")
+        print("3. 防火墙设置是否允许UDP连接")
         return
     else:
-        print("✅ 成功连接到X-Plane")
+        print("✅ 成功使用XPlane-UDP方式接收数据")
     
     try:
         heartbeat_interval = 1.0  # 心跳每秒发送一次
         position_interval = 0.5   # 位置报告每秒发送两次
-        traffic_interval = 0.5    # 交通报告每秒发送两次
-        status_interval = 10.0    # 每10秒显示一次状态
         xplane_check_interval = 10.0  # 每10秒检查一次X-Plane状态
         
         last_heartbeat = time.time()
         last_position = time.time()
-        last_traffic = time.time()
-        last_status = time.time()
         last_xplane_check = time.time()
         
-        mode_text = "自己飞机位置 + 交通目标" if enable_traffic else "自己飞机位置"
-        print(f"开始广播GDL-90数据到FDPRO... (模式: {mode_text})")
-        print(f"目标: {BROADCAST_IP}:{FDPRO_PORT}")
+        print("开始广播GDL-90数据到FDPRO...")
         
         while True:
             current_time = time.time()
@@ -1160,7 +695,7 @@ def broadcast_gdl90(enable_traffic=False):
                 heartbeat_msg = encoder.create_heartbeat()
                 broadcast_sock.sendto(heartbeat_msg, (BROADCAST_IP, FDPRO_PORT))
                 last_heartbeat = current_time
-                print(f"💓 发送心跳 ({len(heartbeat_msg)} bytes)")
+                print(f"💓 发送心跳到 {BROADCAST_IP}:{FDPRO_PORT} ({len(heartbeat_msg)} bytes): {binascii.hexlify(heartbeat_msg).decode()}")
             
             # 发送位置报告
             if current_time - last_position >= position_interval:
@@ -1168,54 +703,15 @@ def broadcast_gdl90(enable_traffic=False):
                     position_msg = encoder.create_position_report(xplane_receiver.current_data)
                     broadcast_sock.sendto(position_msg, (BROADCAST_IP, FDPRO_PORT))
                     last_position = current_time
-                    # 打印位置信息（简化输出）
+                    # 打印位置信息和调试信息
                     data = xplane_receiver.current_data
-                    print(f"✈️  自己飞机 ({len(position_msg)} bytes): "
-                          f"LAT={data['lat']:.6f}, LON={data['lon']:.6f}, ALT={data['alt']:.0f}ft")
+                    print(f"✈️  位置报告到 {BROADCAST_IP}:{FDPRO_PORT} ({len(position_msg)} bytes)")
+                    print(f"   LAT={data['lat']:.6f}, LON={data['lon']:.6f}, ALT={data['alt']:.0f}ft")
+                    print(f"   GDL90 hex: {binascii.hexlify(position_msg).decode()[:64]}...")
                 except Exception as e:
-                    print(f"自己飞机GDL-90编码错误: {e}")
+                    print(f"GDL-90编码错误: {e}")
+                    print(f"数据: {xplane_receiver.current_data}")
                     last_position = current_time  # 防止重复错误
-            
-            # 发送交通报告（仅在启用时）
-            if enable_traffic and current_time - last_traffic >= traffic_interval:
-                active_targets = xplane_receiver.get_active_targets()
-                
-                if active_targets:
-                    sent_count = 0
-                    sample_callsigns = []
-                    
-                    for target in active_targets:
-                        try:
-                            traffic_msg = encoder.create_traffic_report(target)
-                            broadcast_sock.sendto(traffic_msg, (BROADCAST_IP, FDPRO_PORT))
-                            sent_count += 1
-                            
-                            # 收集前3个作为示例
-                            if len(sample_callsigns) < 3:
-                                sample_callsigns.append(target.data['callsign'])
-                                
-                        except Exception as e:
-                            print(f"交通报告编码错误 (目标{target.plane_id}): {e}")
-                    
-                    # 显示汇总信息
-                    if sent_count > 0:
-                        if sent_count <= 3:
-                            print(f"📡 发送交通报告: {', '.join(sample_callsigns)}")
-                        else:
-                            print(f"📡 发送 {sent_count} 个交通报告: {', '.join(sample_callsigns)} 等")
-                
-                last_traffic = current_time
-            
-            # 定期显示状态
-            if current_time - last_status >= status_interval:
-                if enable_traffic:
-                    active_targets = xplane_receiver.get_active_targets()
-                    print(f"📊 状态: {len(active_targets)} 个活跃交通目标")
-                    if not active_targets:
-                        print("   提示: 在X-Plane中启用AI交通以查看交通目标")
-                else:
-                    print("📊 状态: 仅发送自机位置 (使用 --traffic 启用交通目标)")
-                last_status = current_time
             
             time.sleep(0.01)
     
@@ -1225,52 +721,16 @@ def broadcast_gdl90(enable_traffic=False):
         broadcast_sock.close()
 
 if __name__ == "__main__":
-    # 命令行参数解析
-    parser = argparse.ArgumentParser(
-        description="X-Plane 12 到 FDPRO 的 GDL-90 数据广播",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-使用示例:
-  python main.py              # 仅发送自己飞机位置
-  python main.py --traffic    # 发送自己飞机位置 + 交通目标
-  python main.py -t           # 简写形式
-        """
-    )
-    parser.add_argument(
-        '--traffic', '-t',
-        action='store_true',
-        help='启用交通目标报告 (需要X-Plane中有AI交通或多人游戏)'
-    )
-    
-    args = parser.parse_args()
-    
     # 提示信息
     print("="*70)
-    print("X-Plane 12 到 FDPRO 的 GDL-90 数据广播 - 整合版本")
+    print("X-Plane 12 到 FDPRO 的 GDL-90 数据广播 - 独立版本")
     print("="*70)
-    
-    # 显示运行模式
-    if args.traffic:
-        print("🚁 运行模式: 自己飞机位置 + 交通目标报告")
-        print("   - 发送心跳消息 (Heartbeat)")
-        print("   - 发送自己飞机位置报告 (Ownship Report)")
-        print("   - 发送交通目标报告 (Traffic Report)")
-        print("   - 需要X-Plane中启用AI交通或多人游戏")
-    else:
-        print("✈️  运行模式: 仅自己飞机位置报告")
-        print("   - 发送心跳消息 (Heartbeat)")
-        print("   - 发送自己飞机位置报告 (Ownship Report)")
-        print("   - 提示: 使用 --traffic 参数启用交通目标")
-    
-    print()
     print("确保:")
     print("1. X-Plane 12 正在运行")
     print("   - 使用内置XPlane-UDP库进行连接")
-    if args.traffic:
-        print("   - 启用AI交通或多人游戏")
     print("2. FDPRO 正在运行并监听GDL-90数据")
     print(f"   - 监听端口: {FDPRO_PORT}")
     print(f"   - 广播地址: {BROADCAST_IP}")
     print("="*70)
     
-    broadcast_gdl90(enable_traffic=args.traffic)
+    broadcast_gdl90()
