@@ -32,8 +32,8 @@ FDPRO_PORT = 4000        # FDPRO 默认监听端口
 MAX_TRAFFIC_TARGETS = 63    # X-Plane最多支持63个交通目标 (ID: 1-63, 0是自己飞机)
 
 # 广播地址选择 (基于iPad IP地址)：
-BROADCAST_IP = "10.16.25.146"     # iPad的具体IP地址 (直接发送)
-# BROADCAST_IP = "10.16.25.255"     # iPad所在网段的广播地址
+BROADCAST_IP = "127.0.0.1"     # iPad的具体IP地址 (直接发送)
+# BROADCAST_IP = "10.16.25.146"     # iPad所在网段的广播地址
 # BROADCAST_IP = "255.255.255.255"  # 全网络广播 (备用)
 # BROADCAST_IP = "10.16.31.205"     # X-Plane设备IP (如果FDPRO也在该设备)
 

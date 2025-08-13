@@ -16,6 +16,9 @@ import binascii
 import threading
 import datetime
 import argparse
+import logging
+import json
+import os
 from typing import Optional, Dict, Any, List, Tuple
 
 # 配置
@@ -249,7 +252,8 @@ class GDL90Decoder:
         
         # 呼号(8字节ASCII)
         callsign_bytes = data[offset:offset+8]
-        callsign = callsign_bytes.decode('ascii', errors='replace').strip()
+        # 解码ASCII并去除null字符和空白字符
+        callsign = callsign_bytes.decode('ascii', errors='replace').rstrip('\x00').strip()
         offset += 8
         
         # 代码字段
@@ -349,11 +353,13 @@ class GDL90Decoder:
 class GDL90Receiver:
     """GDL-90消息接收器"""
     
-    def __init__(self, port: int = DEFAULT_LISTEN_PORT):
+    def __init__(self, port: int = DEFAULT_LISTEN_PORT, log_file: Optional[str] = None, 
+                 log_level: str = 'INFO', quiet: bool = False):
         self.port = port
         self.running = False
         self.decoder = GDL90Decoder()
         self.socket = None
+        self.quiet = quiet  # 安静模式，只记录日志不显示终端
         
         # 显示选项
         self.show_heartbeat = True
@@ -365,6 +371,135 @@ class GDL90Receiver:
         # 统计信息
         self.last_stats_time = time.time()
         self.stats_interval = 30.0  # 每30秒显示统计
+        
+        # 日志配置
+        self.log_file = log_file
+        self.logger = None
+        self.message_logger = None  # 专门用于记录消息的logger
+        self._setup_logging(log_level)
+        
+        # 消息计数器（用于日志）
+        self.message_count = 0
+    
+    def _setup_logging(self, log_level: str):
+        """设置日志系统"""
+        # 主日志器（用于系统信息）
+        self.logger = logging.getLogger('GDL90Receiver')
+        self.logger.setLevel(getattr(logging, log_level.upper()))
+        
+        # 清除现有的handlers
+        self.logger.handlers.clear()
+        
+        # 消息日志器（专门用于记录GDL-90消息）
+        self.message_logger = logging.getLogger('GDL90Messages')
+        self.message_logger.setLevel(logging.INFO)
+        self.message_logger.handlers.clear()
+        
+        if self.log_file:
+            # 确保日志目录存在
+            log_dir = os.path.dirname(self.log_file) or '.'
+            os.makedirs(log_dir, exist_ok=True)
+            
+            # 主日志文件处理器
+            main_handler = logging.FileHandler(self.log_file, encoding='utf-8')
+            main_formatter = logging.Formatter(
+                '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            )
+            main_handler.setFormatter(main_formatter)
+            self.logger.addHandler(main_handler)
+            
+            # 消息日志文件处理器（单独的文件）
+            message_log_file = self.log_file.replace('.log', '_messages.log')
+            message_handler = logging.FileHandler(message_log_file, encoding='utf-8')
+            message_formatter = logging.Formatter(
+                '%(asctime)s - %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S.%f'
+            )
+            message_handler.setFormatter(message_formatter)
+            self.message_logger.addHandler(message_handler)
+        
+        # 如果不是安静模式，也添加控制台处理器
+        if not self.quiet:
+            console_handler = logging.StreamHandler()
+            console_formatter = logging.Formatter(
+                '%(asctime)s - %(levelname)s - %(message)s',
+                datefmt='%H:%M:%S'
+            )
+            console_handler.setFormatter(console_formatter)
+            self.logger.addHandler(console_handler)
+    
+    def _log_message(self, decoded: Dict[str, Any], sender_addr: Tuple[str, int]):
+        """记录消息到日志文件"""
+        if not self.message_logger:
+            return
+            
+        self.message_count += 1
+        
+        # 基本信息
+        log_entry = {
+            'seq': self.message_count,
+            'timestamp': datetime.datetime.now().isoformat(),
+            'sender': f"{sender_addr[0]}:{sender_addr[1]}",
+            'message_type': decoded.get('message_type', 'Unknown')
+        }
+        
+        # 根据消息类型添加详细信息
+        if 'error' in decoded:
+            log_entry['error'] = decoded['error']
+            log_entry['raw_hex'] = decoded.get('raw_hex', '')
+            log_entry['length'] = decoded.get('length', 0)
+        else:
+            msg_type = decoded.get('message_type')
+            
+            if msg_type == 'Heartbeat':
+                log_entry['data'] = {
+                    'timestamp': decoded['timestamp'],
+                    'timestamp_raw': decoded['timestamp_raw'],
+                    'status1': decoded['status1'],
+                    'status2': decoded['status2'],
+                    'message_count': decoded['message_count']
+                }
+            
+            elif msg_type in ['Ownship Report', 'Traffic Report']:
+                log_entry['data'] = {
+                    'icao_address': decoded['icao_address'],
+                    'latitude': decoded['latitude'],
+                    'longitude': decoded['longitude'],
+                    'altitude_ft': decoded['altitude_ft'],
+                    'ground_speed_kts': decoded.get('ground_speed_kts'),
+                    'vertical_speed_fpm': decoded.get('vertical_speed_fpm'),
+                    'track_deg': decoded['track_deg'],
+                    'callsign': decoded['callsign'],
+                    'emitter_category': decoded['emitter_category'],
+                    'nav_integrity': decoded['nav_integrity'],
+                    'nav_accuracy': decoded['nav_accuracy']
+                }
+                
+                if msg_type == 'Traffic Report':
+                    log_entry['data']['emergency_code'] = decoded.get('emergency_code', 0)
+            
+            else:  # Unknown message
+                log_entry['data'] = {
+                    'message_id': decoded.get('message_id', 'N/A'),
+                    'raw_hex': decoded.get('raw_hex', ''),
+                    'length': decoded.get('length', 0)
+                }
+        
+        # 记录JSON格式的消息
+        self.message_logger.info(json.dumps(log_entry, ensure_ascii=False))
+    
+    def _print_or_log(self, message: str, level: str = 'INFO'):
+        """打印消息到终端或记录到日志"""
+        if self.quiet:
+            # 安静模式，只记录到日志
+            if self.logger:
+                getattr(self.logger, level.lower())(message)
+        else:
+            # 正常模式，打印到终端
+            print(message)
+            if self.logger:
+                getattr(self.logger, level.lower())(message)
     
     def start(self):
         """启动接收器"""
@@ -375,24 +510,34 @@ class GDL90Receiver:
             self.socket.bind(('', self.port))
             self.socket.settimeout(1.0)  # 1秒超时，用于检查运行状态
             
-            print(f"🎯 GDL-90接收器已启动")
-            print(f"📡 监听端口: {self.port}")
-            print(f"⏰ {datetime.datetime.now().strftime('%H:%M:%S')}")
-            print("=" * 60)
+            start_msg = f"🎯 GDL-90接收器已启动\n📡 监听端口: {self.port}\n⏰ {datetime.datetime.now().strftime('%H:%M:%S')}"
+            if self.log_file:
+                start_msg += f"\n📝 日志文件: {self.log_file}"
+                start_msg += f"\n📝 消息日志: {self.log_file.replace('.log', '_messages.log')}"
+            
+            self._print_or_log(start_msg)
+            self._print_or_log("=" * 60)
             
             self.running = True
+            
+            # 记录启动信息到日志
+            if self.logger:
+                self.logger.info(f"GDL-90接收器启动 - 端口: {self.port}")
             
             # 开始接收循环
             self._receive_loop()
             
         except Exception as e:
-            print(f"❌ 启动接收器失败: {e}")
+            error_msg = f"❌ 启动接收器失败: {e}"
+            self._print_or_log(error_msg, 'ERROR')
             return False
     
     def stop(self):
         """停止接收器"""
-        print("\n🛑 正在停止接收器...")
+        self._print_or_log("\n🛑 正在停止接收器...")
         self.running = False
+        if self.logger:
+            self.logger.info("GDL-90接收器停止")
         if self.socket:
             self.socket.close()
     
@@ -410,6 +555,8 @@ class GDL90Receiver:
                         
                         if decoded:
                             self._display_message(decoded, addr)
+                            # 记录消息到日志
+                            self._log_message(decoded, addr)
                         
                         # 定期显示统计信息
                         current_time = time.time()
@@ -422,7 +569,8 @@ class GDL90Receiver:
                     continue
                 except Exception as e:
                     if self.running:
-                        print(f"⚠️  接收错误: {e}")
+                        error_msg = f"⚠️  接收错误: {e}"
+                        self._print_or_log(error_msg, 'WARNING')
                     break
         
         except KeyboardInterrupt:
@@ -430,7 +578,7 @@ class GDL90Receiver:
         finally:
             if self.socket:
                 self.socket.close()
-            print("\n📊 最终统计信息:")
+            self._print_or_log("\n📊 最终统计信息:")
             self._show_stats()
     
     def _display_message(self, decoded: Dict[str, Any], sender_addr: Tuple[str, int]):
@@ -450,64 +598,74 @@ class GDL90Receiver:
         elif 'error' in decoded and not self.show_errors:
             return
         
-        print(f"\n[{current_time}] 📨 从 {sender_addr[0]}:{sender_addr[1]}")
+        if not self.quiet:  # 只有非安静模式才显示到终端
+            print(f"\n[{current_time}] 📨 从 {sender_addr[0]}:{sender_addr[1]}")
         
         if 'error' in decoded:
-            print(f"❌ 错误: {decoded['error']}")
-            print(f"🔍 原始数据: {decoded.get('raw_hex', 'N/A')}")
-            print(f"📏 长度: {decoded.get('length', 0)} 字节")
+            if not self.quiet:
+                print(f"❌ 错误: {decoded['error']}")
+                print(f"🔍 原始数据: {decoded.get('raw_hex', 'N/A')}")
+                print(f"📏 长度: {decoded.get('length', 0)} 字节")
             return
         
-        print(f"📋 消息类型: {msg_type}")
+        if not self.quiet:
+            print(f"📋 消息类型: {msg_type}")
         
-        if msg_type == 'Heartbeat':
-            print(f"⏰ 时间戳: {decoded['timestamp']} ({decoded['timestamp_raw']}s)")
-            print(f"📊 状态1: {decoded['status1']}")
-            print(f"📊 状态2: {decoded['status2']}")
-            print(f"🔢 消息计数: {decoded['message_count']}")
-        
-        elif msg_type in ['Ownship Report', 'Traffic Report']:
-            print(f"🏷️  ICAO地址: {decoded['icao_address']}")
-            print(f"🌍 位置: LAT={decoded['latitude']:.6f}°, LON={decoded['longitude']:.6f}°")
-            print(f"📏 高度: {decoded['altitude_ft']:.0f}ft")
+        if not self.quiet:
+            if msg_type == 'Heartbeat':
+                print(f"⏰ 时间戳: {decoded['timestamp']} ({decoded['timestamp_raw']}s)")
+                print(f"📊 状态1: {decoded['status1']}")
+                print(f"📊 状态2: {decoded['status2']}")
+                print(f"🔢 消息计数: {decoded['message_count']}")
             
-            if decoded['ground_speed_kts'] is not None:
-                print(f"🚀 地速: {decoded['ground_speed_kts']} kts")
-            else:
-                print(f"🚀 地速: 无数据")
+            elif msg_type in ['Ownship Report', 'Traffic Report']:
+                print(f"🏷️  ICAO地址: {decoded['icao_address']}")
+                print(f"🌍 位置: LAT={decoded['latitude']:.6f}°, LON={decoded['longitude']:.6f}°")
+                print(f"📏 高度: {decoded['altitude_ft']:.0f}ft")
                 
-            if decoded['vertical_speed_fpm'] is not None:
-                print(f"⬆️  垂直速度: {decoded['vertical_speed_fpm']:.0f} fpm")
-            else:
-                print(f"⬆️  垂直速度: 无数据")
+                if decoded['ground_speed_kts'] is not None:
+                    print(f"🚀 地速: {decoded['ground_speed_kts']} kts")
+                else:
+                    print(f"🚀 地速: 无数据")
+                    
+                if decoded['vertical_speed_fpm'] is not None:
+                    print(f"⬆️  垂直速度: {decoded['vertical_speed_fpm']:.0f} fpm")
+                else:
+                    print(f"⬆️  垂直速度: 无数据")
+                    
+                print(f"🧭 航向: {decoded['track_deg']:.1f}°")
+                print(f"📻 呼号: '{decoded['callsign']}'")
+                print(f"✈️  发射器类别: {decoded['emitter_category']}")
                 
-            print(f"🧭 航向: {decoded['track_deg']:.1f}°")
-            print(f"📻 呼号: '{decoded['callsign']}'")
-            print(f"✈️  发射器类别: {decoded['emitter_category']}")
+                # Traffic Report特有信息
+                if msg_type == 'Traffic Report':
+                    if decoded['emergency_code'] != 0:
+                        print(f"🚨 应急代码: {decoded['emergency_code']}")
+                
+                # 导航质量信息
+                print(f"📡 导航完整性: {decoded['nav_integrity']}, 精度: {decoded['nav_accuracy']}")
             
-            # Traffic Report特有信息
-            if msg_type == 'Traffic Report':
-                if decoded['emergency_code'] != 0:
-                    print(f"🚨 应急代码: {decoded['emergency_code']}")
-            
-            # 导航质量信息
-            print(f"📡 导航完整性: {decoded['nav_integrity']}, 精度: {decoded['nav_accuracy']}")
-        
-        print("-" * 40)
+            print("-" * 40)
     
     def _show_stats(self):
         """显示统计信息"""
         stats = self.decoder.get_stats()
-        print(f"\n📈 统计信息 [{datetime.datetime.now().strftime('%H:%M:%S')}]:")
-        print(f"   总消息数: {stats['total_messages']}")
-        print(f"   心跳: {stats['heartbeat_count']}")
-        print(f"   自机报告: {stats['ownship_count']}")
-        print(f"   交通报告: {stats['traffic_count']}")
+        stats_msg = f"\n📈 统计信息 [{datetime.datetime.now().strftime('%H:%M:%S')}]:\n"
+        stats_msg += f"   总消息数: {stats['total_messages']}\n"
+        stats_msg += f"   心跳: {stats['heartbeat_count']}\n"
+        stats_msg += f"   自机报告: {stats['ownship_count']}\n"
+        stats_msg += f"   交通报告: {stats['traffic_count']}\n"
         if stats['unknown_count'] > 0:
-            print(f"   未知消息: {stats['unknown_count']}")
+            stats_msg += f"   未知消息: {stats['unknown_count']}\n"
         if stats['crc_errors'] > 0:
-            print(f"   CRC错误: {stats['crc_errors']}")
-        print("-" * 40)
+            stats_msg += f"   CRC错误: {stats['crc_errors']}\n"
+        stats_msg += "-" * 40
+        
+        self._print_or_log(stats_msg)
+        
+        # 记录统计信息到主日志
+        if self.logger:
+            self.logger.info(f"统计信息 - 总计: {stats['total_messages']}, 心跳: {stats['heartbeat_count']}, 自机: {stats['ownship_count']}, 交通: {stats['traffic_count']}, CRC错误: {stats['crc_errors']}")
 
 def main():
     """主程序"""
@@ -516,10 +674,13 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 使用示例:
-  python gdl90_receiver.py                    # 默认端口4000
-  python gdl90_receiver.py -p 5000           # 指定端口5000
-  python gdl90_receiver.py --no-heartbeat    # 不显示心跳消息
-  python gdl90_receiver.py --traffic-only    # 只显示交通报告
+  python gdl90_receiver.py                              # 默认端口4000
+  python gdl90_receiver.py -p 5000                     # 指定端口5000
+  python gdl90_receiver.py --no-heartbeat              # 不显示心跳消息
+  python gdl90_receiver.py --traffic-only              # 只显示交通报告
+  python gdl90_receiver.py -l receiver.log             # 记录日志到文件
+  python gdl90_receiver.py -l receiver.log --quiet     # 安静模式，只记录日志
+  python gdl90_receiver.py -l receiver.log --log-level DEBUG  # 调试级别日志
         """
     )
     
@@ -554,10 +715,35 @@ def main():
         help='不显示错误消息'
     )
     
+    # 日志相关参数
+    parser.add_argument(
+        '-l', '--log-file',
+        type=str,
+        help='日志文件路径 (例如: gdl90_receiver.log)'
+    )
+    
+    parser.add_argument(
+        '--log-level',
+        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+        default='INFO',
+        help='日志级别 (默认: INFO)'
+    )
+    
+    parser.add_argument(
+        '-q', '--quiet',
+        action='store_true',
+        help='安静模式：只记录日志，不显示终端输出'
+    )
+    
     args = parser.parse_args()
     
     # 创建接收器
-    receiver = GDL90Receiver(port=args.port)
+    receiver = GDL90Receiver(
+        port=args.port,
+        log_file=args.log_file,
+        log_level=args.log_level,
+        quiet=args.quiet
+    )
     
     # 设置显示选项
     if args.no_heartbeat:
@@ -571,34 +757,41 @@ def main():
     if args.no_errors:
         receiver.show_errors = False
     
-    print("=" * 60)
-    print("🛩️  GDL-90 消息接收器和解码器")
-    print("=" * 60)
-    print(f"📡 监听端口: {args.port}")
-    
-    # 显示过滤设置
-    filters = []
-    if not receiver.show_heartbeat:
-        filters.append("心跳")
-    if not receiver.show_ownship:
-        filters.append("自机报告")
-    if not receiver.show_traffic:
-        filters.append("交通报告")
-    if not receiver.show_unknown:
-        filters.append("未知消息")
-    if not receiver.show_errors:
-        filters.append("错误")
-    
-    if filters:
-        print(f"🔇 过滤消息: {', '.join(filters)}")
-    
-    print("\n💡 使用 Ctrl+C 停止接收器")
-    print("=" * 60)
+    # 显示启动信息（除非是安静模式）
+    if not args.quiet:
+        print("=" * 60)
+        print("🛩️  GDL-90 消息接收器和解码器")
+        print("=" * 60)
+        print(f"📡 监听端口: {args.port}")
+        
+        if args.log_file:
+            print(f"📝 日志文件: {args.log_file}")
+            print(f"📝 消息日志: {args.log_file.replace('.log', '_messages.log')}")
+        
+        # 显示过滤设置
+        filters = []
+        if not receiver.show_heartbeat:
+            filters.append("心跳")
+        if not receiver.show_ownship:
+            filters.append("自机报告")
+        if not receiver.show_traffic:
+            filters.append("交通报告")
+        if not receiver.show_unknown:
+            filters.append("未知消息")
+        if not receiver.show_errors:
+            filters.append("错误")
+        
+        if filters:
+            print(f"🔇 过滤消息: {', '.join(filters)}")
+        
+        print("\n💡 使用 Ctrl+C 停止接收器")
+        print("=" * 60)
     
     try:
         receiver.start()
     except KeyboardInterrupt:
-        print("\n👋 接收器已停止")
+        if not args.quiet:
+            print("\n👋 接收器已停止")
 
 if __name__ == "__main__":
     main()
